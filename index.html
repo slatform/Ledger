@@ -520,17 +520,23 @@ function AddForm({
   const initial = {};
   fields.forEach(f => initial[f.name] = f.default !== undefined ? f.default : "");
   const [form, setForm] = useState(initial);
+  const numberFields = fields.filter(f => f.type === "number");
   const submit = e => {
     e.preventDefault();
-    if (!form.name || !form.amount || Number(form.amount) <= 0) return;
-    onAdd({
+    if (!form.name || !form.name.trim()) return;
+    for (const f of numberFields) {
+      if (form[f.name] === "" || isNaN(Number(form[f.name]))) return;
+    }
+    const primary = numberFields[0]?.name;
+    if (primary && Number(form[primary]) <= 0) return;
+    const entry = {
       ...form,
-      id: uid(),
-      amount: Number(form.amount),
-      apr: form.apr !== undefined ? Number(form.apr) : undefined,
-      minPayment: form.minPayment !== undefined ? Number(form.minPayment) : undefined,
-      balance: form.balance !== undefined ? Number(form.balance) : undefined
+      id: uid()
+    };
+    numberFields.forEach(f => {
+      entry[f.name] = Number(form[f.name]);
     });
+    onAdd(entry);
     setForm(initial);
   };
   return /*#__PURE__*/React.createElement("form", {
