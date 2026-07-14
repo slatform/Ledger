@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Ledger — Personal Finance</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --paper: #EEECE3;
+    --card-bg: #F8F6EF;
+    --ink: #1A1814;
+    --ink-red: #8B3227;
+    --ink-green: #2F4A3D;
+    --rule: #CCC5B0;
+    --brass: #9C7A3C;
+    --font-display: 'Source Serif 4', Georgia, serif;
+    --font-sans: 'Inter', sans-serif;
+    --font-mono: 'IBM Plex Mono', monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--paper); }
+  body { font-family: var(--font-sans); color: var(--ink); }
+  input, select, button { font-family: inherit; }
+  button:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--brass); outline-offset: 1px;
+  }
+  ::-webkit-scrollbar { width: 8px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+const FREQ_MULT = { weekly: 4.345, biweekly: 2.1725, monthly: 1, annual: 1 / 12 };
+const FREQ_LABEL = { weekly: "/wk", biweekly: "/2wk", monthly: "/mo", annual: "/yr" };
+const EXPENSE_CATEGORIES = ["Housing", "Transportation", "Food", "Utilities", "Insurance", "Health", "Entertainment", "Savings", "Other"];
+const DEBT_TYPES = ["Credit Card", "Auto Loan", "Student Loan", "Personal Loan", "Mortgage", "Other"];
+const PIE_COLORS = ["#7A2E2A", "#9C7A3C", "#2F4A3D", "#4A5A6A", "#6B4A3A", "#8C6B47", "#3A5A4A", "#5A4A3A", "#7A6A5A"];
+
+const money = (n) =>
+  (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+function loadList(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+function saveList(key, list) {
+  try {
+    localStorage.setItem(key, JSON.stringify(list));
+  } catch (e) {
+    console.error("Storage save failed", key, e);
+  }
+}
+
+function monthlyAmount(entry) {
+  return entry.amount * (FREQ_MULT[entry.frequency] || 1);
+}
+
+function simulatePayoff(debts, extraPayment, strategy) {
+  if (!debts.length) return { months: 0, totalInterest: 0, history: [], payoffOrder: [] };
+  const working = debts.map((d) => ({ ...d, balance: Number(d.balance) }));
+  const order = [...working]
+    .sort((a, b) => (strategy === "avalanche" ? b.apr - a.apr : a.balance - b.balance))
+    .map((d) => d.id);
+  let totalInterest = 0;
+  let month = 0;
+  const history = [{ month: 0, balance: Math.round(working.reduce((s, d) => s + d.balance, 0)) }];
+  const payoffMonth = {};
+  const maxMonths = 480;
+
+  while (working.some((d) => d.balance > 0.01) && month < maxMonths) {
+    month++;
+    for (const d of working) {
+      if (d.balance <= 0) continue;
+      const interest = d.balance * (d.apr / 100 / 12);
+      totalInterest += interest;
+      d.balance += interest;
+      const pay = Math.min(d.minPayment, d.balance);
+      d.balance -= pay;
+    }
+    const paidOffMin = working.filter((d) => d.balance <= 0.01).reduce((s, d) => s + Number(d.minPayment), 0);
+    let freedUp = Number(extraPayment) + paidOffMin;
+    for (const id of order) {
+      if (freedUp <= 0) break;
+      const d = working.find((x) => x.id === id);
+      if (!d || d.balance <= 0) continue;
+      const pay = Math.min(freedUp, d.balance);
+      d.balance -= pay;
+      freedUp -= pay;
+    }
+    for (const d of working) {
+      if (d.balance <= 0.01 && !(d.id in payoffMonth)) payoffMonth[d.id] = month;
+    }
+    const totalBal = working.reduce((s, d) => s + Math.max(d.balance, 0), 0);
+    history.push({ month, balance: Math.round(totalBal) });
+    if (totalBal <= 0.01) break;
+  }
+  const payoffOrder = order.map((id, i) => ({
+    id,
+    name: debts.find((d) => d.id === id)?.name || "",
+    month: payoffMonth[id] ?? month,
+    rank: i + 1,
+  }));
+  return { months: month, totalInterest: Math.round(totalInterest), history, payoffOrder };
+}
+
+/* ---------- Dependency-free SVG charts ---------- */
+
+function polarToCartesian(cx, cy, r, angleDeg) {
+  const rad = ((angleDeg - 90) * Math.PI) / 180;
+  return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
+}
+function donutSlicePath(cx, cy, rOuter, rInner, startAngle, endAngle) {
+  const p1 = polarToCartesian(cx, cy, rOuter, startAngle);
+  const p2 = polarToCartesian(cx, cy, rOuter, endAngle);
+  const p3 = polarToCartesian(cx, cy, rInner, endAngle);
+  const p4 = polarToCartesian(cx, cy, rInner, startAngle);
+  const largeArc = endAngle - startAngle > 180 ? 1 : 0;
+  return `M ${p1.x} ${p1.y} A ${rOuter} ${rOuter} 0 ${largeArc} 1 ${p2.x} ${p2.y} L ${p3.x} ${p3.y} A ${rInner} ${rInner} 0 ${largeArc} 0 ${p4.x} ${p4.y} Z`;
+}
+
+function DonutChart({ data, size = 180 }) {
+  const [hover, setHover] = useState(null);
+  const total = data.reduce((s, d) => s + d.value, 0) || 1;
+  const cx = size / 2, cy = size / 2, rOuter = size / 2 - 6, rInner = rOuter * 0.55;
+  let angle = 0;
+  const slices = data.map((d, i) => {
+    const start = angle;
+    const sweep = (d.value / total) * 360;
+    angle += sweep;
+    return { ...d, start, end: angle, color: PIE_COLORS[i % PIE_COLORS.length] };
+  });
+  return (
+    <div style={{ position: "relative", width: size, height: size }}>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        {slices.map((s) => (
+          <path key={s.name} d={donutSlicePath(cx, cy, rOuter, rInner, s.start, s.end)}
+            fill={s.color} opacity={hover && hover !== s.name ? 0.45 : 1}
+            onMouseEnter={() => setHover(s.name)} onMouseLeave={() => setHover(null)}
+            style={{ cursor: "pointer", transition: "opacity 0.15s" }} />
+        ))}
+      </svg>
+      {hover && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+          <div style={{ fontFamily: "var(--font-sans)", fontSize: 11, color: "#6a6555", textAlign: "center", maxWidth: size * 0.55 }}>{hover}</div>
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: 14, fontWeight: 600 }}>
+            {money(slices.find((s) => s.name === hover).value)}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LineChartSVG({ data, width = 600, height = 180, color = "var(--ink-red)" }) {
+  const padding = { left: 46, right: 14, top: 12, bottom: 26 };
+  const w = width - padding.left - padding.right;
+  const h = height - padding.top - padding.bottom;
+  const maxY = Math.max(...data.map((d) => d.balance), 1);
+  const maxX = Math.max(...data.map((d) => d.month), 1);
+  const [hoverIdx, setHoverIdx] = useState(null);
+
+  const xOf = (m) => padding.left + (m / maxX) * w;
+  const yOf = (b) => padding.top + h - (b / maxY) * h;
+  const points = data.map((d) => `${xOf(d.month)},${yOf(d.balance)}`).join(" ");
+  const gridLines = 4;
+
+  return (
+    <svg width="100%" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet"
+      onMouseLeave={() => setHoverIdx(null)}
+      onMouseMove={(e) => {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const relX = ((e.clientX - rect.left) / rect.width) * width;
+        const m = Math.round(((relX - padding.left) / w) * maxX);
+        const idx = data.findIndex((d) => d.month === Math.max(0, Math.min(maxX, m)));
+        setHoverIdx(idx >= 0 ? idx : null);
+      }}>
+      {Array.from({ length: gridLines + 1 }).map((_, i) => {
+        const y = padding.top + (h / gridLines) * i;
+        const val = Math.round(maxY - (maxY / gridLines) * i);
+        return (
+          <g key={i}>
+            <line x1={padding.left} x2={width - padding.right} y1={y} y2={y} stroke="var(--rule)" strokeDasharray="3 3" />
+            <text x={padding.left - 8} y={y + 3} fontSize="9" fontFamily="var(--font-mono)" fill="#8a8471" textAnchor="end">
+              ${(val / 1000).toFixed(0)}k
+            </text>
+          </g>
+        );
+      })}
+      <polyline points={points} fill="none" stroke={color} strokeWidth="2" />
+      <text x={width / 2} y={height - 4} fontSize="9" fontFamily="var(--font-sans)" fill="#8a8471" textAnchor="middle">months</text>
+      {hoverIdx !== null && data[hoverIdx] && (
+        <g>
+          <line x1={xOf(data[hoverIdx].month)} x2={xOf(data[hoverIdx].month)} y1={padding.top} y2={padding.top + h} stroke="var(--brass)" strokeWidth="1" />
+          <circle cx={xOf(data[hoverIdx].month)} cy={yOf(data[hoverIdx].balance)} r="4" fill={color} />
+          <rect x={Math.min(xOf(data[hoverIdx].month) + 8, width - 110)} y={padding.top} width="100" height="32" fill="#fff" stroke="var(--rule)" rx="3" />
+          <text x={Math.min(xOf(data[hoverIdx].month) + 14, width - 104)} y={padding.top + 13} fontSize="9" fontFamily="var(--font-sans)" fill="#6a6555">Month {data[hoverIdx].month}</text>
+          <text x={Math.min(xOf(data[hoverIdx].month) + 14, width - 104)} y={padding.top + 25} fontSize="11" fontFamily="var(--font-mono)" fontWeight="600" fill="var(--ink)">{money(data[hoverIdx].balance)}</text>
+        </g>
+      )}
+    </svg>
+  );
+}
+
+/* ---------- Minimal inline icons ---------- */
+const Icon = {
+  Wallet: () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="6" width="20" height="14" rx="2"/><path d="M2 10h20"/><circle cx="17" cy="14" r="1.4" fill="currentColor" stroke="none"/></svg>,
+  Down: () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 7 11 15 15 11 21 17"/><polyline points="21 10 21 17 14 17"/></svg>,
+  Up: () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 17 11 9 15 13 21 7"/><polyline points="14 7 21 7 21 14"/></svg>,
+  Card: () => <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg>,
+  Trash: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>,
+  Plus: () => <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+};
+
+function EntryRow({ label, sub, amount, negative, onDelete }) {
+  return (
+    <div style={row.wrap}>
+      <div style={{ minWidth: 0 }}>
+        <div style={row.label}>{label}</div>
+        {sub && <div style={row.sub}>{sub}</div>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        <div style={{ ...row.amount, color: negative ? "var(--ink-red)" : "var(--ink)" }}>{money(amount)}</div>
+        <button onClick={onDelete} style={row.delBtn} aria-label={`Delete ${label}`}><Icon.Trash /></button>
+      </div>
+    </div>
+  );
+}
+
+const row = {
+  wrap: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 2px", borderBottom: "1px dashed var(--rule)", gap: 12 },
+  label: { fontFamily: "var(--font-sans)", fontSize: 14, color: "var(--ink)", fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  sub: { fontFamily: "var(--font-sans)", fontSize: 11.5, color: "#7a7568", marginTop: 1 },
+  amount: { fontFamily: "var(--font-mono)", fontSize: 14.5, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" },
+  delBtn: { border: "none", background: "transparent", color: "#a89f8c", cursor: "pointer", padding: 4, display: "flex" },
+};
+
+function AddForm({ fields, onAdd, buttonLabel }) {
+  const initial = {};
+  fields.forEach((f) => (initial[f.name] = f.default !== undefined ? f.default : ""));
+  const [form, setForm] = useState(initial);
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!form.name || !form.amount || Number(form.amount) <= 0) return;
+    onAdd({
+      ...form, id: uid(), amount: Number(form.amount),
+      apr: form.apr !== undefined ? Number(form.apr) : undefined,
+      minPayment: form.minPayment !== undefined ? Number(form.minPayment) : undefined,
+      balance: form.balance !== undefined ? Number(form.balance) : undefined,
+    });
+    setForm(initial);
+  };
+
+  return (
+    <form onSubmit={submit} style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "flex-end", padding: "12px 2px 16px" }}>
+      {fields.map((f) => (
+        <div key={f.name} style={{ display: "flex", flexDirection: "column", gap: 3, flex: f.flex || "1 1 100px", minWidth: f.minWidth || 90 }}>
+          <label style={formStyles.label}>{f.label}</label>
+          {f.type === "select" ? (
+            <select style={formStyles.input} value={form[f.name]} onChange={(e) => setForm({ ...form, [f.name]: e.target.value })}>
+              {f.options.map((o) => <option key={o} value={o}>{o}</option>)}
+            </select>
+          ) : (
+            <input style={formStyles.input} type={f.type || "text"} step={f.step} placeholder={f.placeholder}
+              value={form[f.name]} onChange={(e) => setForm({ ...form, [f.name]: e.target.value })} />
+          )}
+        </div>
+      ))}
+      <button type="submit" style={formStyles.addBtn}><Icon.Plus /> {buttonLabel || "Add"}</button>
+    </form>
+  );
+}
+
+const formStyles = {
+  label: { fontFamily: "var(--font-sans)", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em", color: "#8a8471" },
+  input: { fontFamily: "var(--font-sans)", fontSize: 13, padding: "7px 8px", border: "1px solid var(--rule)", borderRadius: 3, background: "#fff", color: "var(--ink)", outline: "none" },
+  addBtn: { display: "flex", alignItems: "center", gap: 5, fontFamily: "var(--font-sans)", fontSize: 12.5, fontWeight: 700, background: "var(--ink)", color: "var(--paper)", border: "none", borderRadius: 3, padding: "8px 14px", cursor: "pointer", height: 31 },
+};
+
+function Card({ title, children, right }) {
+  return (
+    <div style={{ background: "var(--card-bg)", border: "1px solid var(--rule)", borderRadius: 4, padding: "16px 18px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+        <h3 style={{ fontFamily: "var(--font-display)", fontSize: 14, letterSpacing: "0.04em", textTransform: "uppercase", color: "var(--ink)", margin: 0, fontWeight: 600 }}>{title}</h3>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function Stat({ icon, label, value, negative }) {
+  return (
+    <div style={{ background: "var(--card-bg)", border: "1px solid var(--rule)", borderRadius: 4, padding: "12px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, color: "var(--brass)", marginBottom: 6 }}>
+        {icon}
+        <span style={{ fontFamily: "var(--font-sans)", fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase", fontWeight: 700 }}>{label}</span>
+      </div>
+      <div style={{ fontFamily: "var(--font-mono)", fontSize: 19, fontWeight: 600, color: negative ? "var(--ink-red)" : "var(--ink)" }}>{value}</div>
+    </div>
+  );
+}
+
+function Empty({ text }) {
+  return <div style={{ fontSize: 12.5, color: "#8a8471", fontStyle: "italic", padding: "6px 2px 12px" }}>{text}</div>;
+}
+
+function FinancialLedger() {
+  const [tab, setTab] = useState("overview");
+  const [income, setIncome] = useState(() => loadList("ledger:income"));
+  const [expenses, setExpenses] = useState(() => loadList("ledger:expenses"));
+  const [debts, setDebts] = useState(() => loadList("ledger:debts"));
+  const [assets, setAssets] = useState(() => loadList("ledger:assets"));
+  const [extraPayment, setExtraPayment] = useState(200);
+  const [strategy, setStrategy] = useState("avalanche");
+
+  const addIncome = useCallback((entry) => { const next = [...income, entry]; setIncome(next); saveList("ledger:income", next); }, [income]);
+  const delIncome = useCallback((id) => { const next = income.filter((x) => x.id !== id); setIncome(next); saveList("ledger:income", next); }, [income]);
+  const addExpense = useCallback((entry) => { const next = [...expenses, entry]; setExpenses(next); saveList("ledger:expenses", next); }, [expenses]);
+  const delExpense = useCallback((id) => { const next = expenses.filter((x) => x.id !== id); setExpenses(next); saveList("ledger:expenses", next); }, [expenses]);
+  const addDebt = useCallback((entry) => { const next = [...debts, entry]; setDebts(next); saveList("ledger:debts", next); }, [debts]);
+  const delDebt = useCallback((id) => { const next = debts.filter((x) => x.id !== id); setDebts(next); saveList("ledger:debts", next); }, [debts]);
+  const addAsset = useCallback((entry) => { const next = [...assets, entry]; setAssets(next); saveList("ledger:assets", next); }, [assets]);
+  const delAsset = useCallback((id) => { const next = assets.filter((x) => x.id !== id); setAssets(next); saveList("ledger:assets", next); }, [assets]);
+
+  const totalMonthlyIncome = useMemo(() => income.reduce((s, e) => s + monthlyAmount(e), 0), [income]);
+  const totalMonthlyExpenses = useMemo(() => expenses.reduce((s, e) => s + monthlyAmount(e), 0), [expenses]);
+  const totalMinPayments = useMemo(() => debts.reduce((s, d) => s + Number(d.minPayment), 0), [debts]);
+  const totalDebt = useMemo(() => debts.reduce((s, d) => s + Number(d.balance), 0), [debts]);
+  const totalAssets = useMemo(() => assets.reduce((s, a) => s + Number(a.amount), 0), [assets]);
+  const netWorth = totalAssets - totalDebt;
+  const cashFlow = totalMonthlyIncome - totalMonthlyExpenses - totalMinPayments;
+
+  const expenseByCategory = useMemo(() => {
+    const map = {};
+    expenses.forEach((e) => { map[e.category] = (map[e.category] || 0) + monthlyAmount(e); });
+    return Object.entries(map).map(([name, value]) => ({ name, value: Math.round(value) })).sort((a, b) => b.value - a.value);
+  }, [expenses]);
+
+  const payoff = useMemo(() => simulatePayoff(debts, Math.max(extraPayment, 0), strategy), [debts, extraPayment, strategy]);
+
+  const TABS = [
+    { id: "overview", label: "Overview" },
+    { id: "income", label: "Income" },
+    { id: "expenses", label: "Expenses" },
+    { id: "debts", label: "Debts" },
+  ];
+
+  return (
+    <div style={{ background: "var(--paper)", minHeight: "100vh", fontFamily: "var(--font-sans)", padding: "22px 18px 60px" }}>
+      <div style={{ maxWidth: 920, margin: "0 auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 18, flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <div style={{ fontFamily: "var(--font-sans)", fontSize: 10, letterSpacing: "0.18em", color: "var(--brass)", fontWeight: 700 }}>PERSONAL FINANCE</div>
+            <h1 style={{ fontFamily: "var(--font-display)", fontSize: 30, color: "var(--ink)", margin: "2px 0 0", fontWeight: 700, letterSpacing: "-0.01em" }}>The Ledger</h1>
+          </div>
+          <div style={{
+            border: `2px double ${netWorth >= 0 ? "var(--ink-green)" : "var(--ink-red)"}`,
+            borderRadius: 6, padding: "8px 18px", transform: "rotate(-1.2deg)", background: "rgba(255,255,255,0.4)",
+          }}>
+            <div style={{ fontSize: 9, letterSpacing: "0.14em", fontWeight: 700, color: netWorth >= 0 ? "var(--ink-green)" : "var(--ink-red)", textAlign: "center" }}>NET WORTH</div>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 20, fontWeight: 600, color: netWorth >= 0 ? "var(--ink-green)" : "var(--ink-red)", textAlign: "center" }}>{money(netWorth)}</div>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 4, marginBottom: 18, borderBottom: "1px solid var(--rule)" }}>
+          {TABS.map((t) => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              fontFamily: "var(--font-sans)", fontSize: 12.5, fontWeight: 700, letterSpacing: "0.03em",
+              padding: "9px 16px", border: "none", background: "transparent", cursor: "pointer",
+              color: tab === t.id ? "var(--ink)" : "#8a8471",
+              borderBottom: tab === t.id ? "2px solid var(--brass)" : "2px solid transparent",
+              marginBottom: -1, textTransform: "uppercase",
+            }}>{t.label}</button>
+          ))}
+        </div>
+
+        {tab === "overview" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12 }}>
+              <Stat icon={<Icon.Wallet />} label="Monthly Income" value={money(totalMonthlyIncome)} />
+              <Stat icon={<Icon.Down />} label="Monthly Expenses" value={money(totalMonthlyExpenses)} />
+              <Stat icon={<Icon.Card />} label="Total Debt" value={money(totalDebt)} negative={totalDebt > 0} />
+              <Stat icon={cashFlow >= 0 ? <Icon.Up /> : <Icon.Down />} label="Monthly Cash Flow" value={money(cashFlow)} negative={cashFlow < 0} />
+            </div>
+
+            <Card title="Assets" right={<span style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>{money(totalAssets)}</span>}>
+              {assets.length === 0 && <Empty text="No assets logged yet — savings, investments, property equity." />}
+              {assets.map((a) => <EntryRow key={a.id} label={a.name} amount={a.amount} onDelete={() => delAsset(a.id)} />)}
+              <AddForm buttonLabel="Add asset" fields={[
+                { name: "name", label: "Asset", placeholder: "e.g. Savings account", flex: "2 1 160px" },
+                { name: "amount", label: "Value", type: "number", step: "0.01", placeholder: "0.00", flex: "1 1 100px" },
+              ]} onAdd={addAsset} />
+            </Card>
+
+            {expenseByCategory.length > 0 && (
+              <Card title="Expenses by Category">
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 20, alignItems: "center" }}>
+                  <DonutChart data={expenseByCategory} />
+                  <div style={{ flex: "1 1 200px", minWidth: 160 }}>
+                    {expenseByCategory.map((c, i) => (
+                      <div key={c.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "4px 0", borderBottom: "1px dashed var(--rule)" }}>
+                        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{ width: 8, height: 8, borderRadius: 2, background: PIE_COLORS[i % PIE_COLORS.length], display: "inline-block" }} />
+                          {c.name}
+                        </span>
+                        <span style={{ fontFamily: "var(--font-mono)" }}>{money(c.value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </Card>
+            )}
+          </div>
+        )}
+
+        {tab === "income" && (
+          <Card title="Income Sources" right={<span style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>{money(totalMonthlyIncome)}/mo</span>}>
+            {income.length === 0 && <Empty text="No income sources yet. Add your paycheck, freelance income, or other cash flow below." />}
+            {income.map((e) => <EntryRow key={e.id} label={e.name} sub={`${money(e.amount)} ${FREQ_LABEL[e.frequency]}`} amount={monthlyAmount(e)} onDelete={() => delIncome(e.id)} />)}
+            <AddForm buttonLabel="Add income" fields={[
+              { name: "name", label: "Source", placeholder: "e.g. Salary", flex: "2 1 160px" },
+              { name: "amount", label: "Amount", type: "number", step: "0.01", placeholder: "0.00", flex: "1 1 100px" },
+              { name: "frequency", label: "Frequency", type: "select", options: ["monthly", "biweekly", "weekly", "annual"], default: "monthly", flex: "1 1 110px" },
+            ]} onAdd={addIncome} />
+          </Card>
+        )}
+
+        {tab === "expenses" && (
+          <Card title="Expenses" right={<span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--ink-red)" }}>{money(totalMonthlyExpenses)}/mo</span>}>
+            {expenses.length === 0 && <Empty text="No expenses yet. Log recurring bills, subscriptions, and everyday spending." />}
+            {expenses.map((e) => <EntryRow key={e.id} label={e.name} sub={`${e.category} · ${money(e.amount)} ${FREQ_LABEL[e.frequency]}`} amount={monthlyAmount(e)} negative onDelete={() => delExpense(e.id)} />)}
+            <AddForm buttonLabel="Add expense" fields={[
+              { name: "name", label: "Expense", placeholder: "e.g. Rent", flex: "2 1 150px" },
+              { name: "category", label: "Category", type: "select", options: EXPENSE_CATEGORIES, default: "Housing", flex: "1 1 130px" },
+              { name: "amount", label: "Amount", type: "number", step: "0.01", placeholder: "0.00", flex: "1 1 100px" },
+              { name: "frequency", label: "Frequency", type: "select", options: ["monthly", "biweekly", "weekly", "annual"], default: "monthly", flex: "1 1 110px" },
+            ]} onAdd={addExpense} />
+          </Card>
+        )}
+
+        {tab === "debts" && (
+          <div style={{ display: "grid", gap: 14 }}>
+            <Card title="Debts" right={<span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: "var(--ink-red)" }}>{money(totalDebt)}</span>}>
+              {debts.length === 0 && <Empty text="No debts logged. Add credit cards, loans, or lines of credit with their balance, APR, and minimum payment." />}
+              {debts.map((d) => <EntryRow key={d.id} label={d.name} sub={`${d.debtType} · ${d.apr}% APR · min ${money(d.minPayment)}/mo`} amount={d.balance} negative onDelete={() => delDebt(d.id)} />)}
+              <AddForm buttonLabel="Add debt" fields={[
+                { name: "name", label: "Debt", placeholder: "e.g. Visa card", flex: "2 1 140px" },
+                { name: "debtType", label: "Type", type: "select", options: DEBT_TYPES, default: "Credit Card", flex: "1 1 130px" },
+                { name: "balance", label: "Balance", type: "number", step: "0.01", placeholder: "0.00", flex: "1 1 100px" },
+                { name: "apr", label: "APR %", type: "number", step: "0.01", placeholder: "0", flex: "1 1 80px" },
+                { name: "minPayment", label: "Min Payment", type: "number", step: "0.01", placeholder: "0.00", flex: "1 1 100px" },
+              ]} onAdd={addDebt} />
+            </Card>
+
+            {debts.length > 0 && (
+              <Card title="Payoff Plan">
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginBottom: 14 }}>
+                  <div>
+                    <div style={formStyles.label}>Strategy</div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+                      {["avalanche", "snowball"].map((s) => (
+                        <button key={s} onClick={() => setStrategy(s)} style={{
+                          fontFamily: "var(--font-sans)", fontSize: 11.5, fontWeight: 700, textTransform: "capitalize",
+                          padding: "6px 12px", borderRadius: 3, border: `1px solid ${strategy === s ? "var(--ink)" : "var(--rule)"}`,
+                          background: strategy === s ? "var(--ink)" : "transparent", color: strategy === s ? "var(--paper)" : "var(--ink)", cursor: "pointer",
+                        }}>{s}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={formStyles.label}>Extra payment / month</div>
+                    <input type="number" step="1" value={extraPayment} onChange={(e) => setExtraPayment(Number(e.target.value) || 0)}
+                      style={{ ...formStyles.input, marginTop: 4, width: 110 }} />
+                  </div>
+                  <div style={{ marginLeft: "auto", textAlign: "right" }}>
+                    <div style={formStyles.label}>Debt-free in</div>
+                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 18, fontWeight: 600 }}>
+                      {payoff.months} mo <span style={{ fontSize: 12, color: "#8a8471" }}>({(payoff.months / 12).toFixed(1)} yrs)</span>
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={formStyles.label}>Total interest paid</div>
+                    <div style={{ fontFamily: "var(--font-mono)", fontSize: 18, fontWeight: 600, color: "var(--ink-red)" }}>{money(payoff.totalInterest)}</div>
+                  </div>
+                </div>
+
+                <div style={{ marginBottom: 14 }}>
+                  <LineChartSVG data={payoff.history} />
+                </div>
+
+                <div style={formStyles.label}>Payoff order ({strategy})</div>
+                <div style={{ marginTop: 6 }}>
+                  {payoff.payoffOrder.map((p) => (
+                    <div key={p.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "5px 0", borderBottom: "1px dashed var(--rule)" }}>
+                      <span>{p.rank}. {p.name}</span>
+                      <span style={{ fontFamily: "var(--font-mono)", color: "#6a6555" }}>paid off month {p.month}</span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
+          </div>
+        )}
+
+        <div style={{ marginTop: 28, fontSize: 11, color: "#8a8471", textAlign: "center" }}>
+          Data is stored locally in this browser only.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<FinancialLedger />);
+</script>
+</body>
+</html>
